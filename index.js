@@ -157,12 +157,22 @@ app.post('/groupme/webhook', async (req, res) => {
     );
 
     // Build a simple scoreboard message
-    let msg = '📊 Daily Leaderboard Update:\n';
-    standings.forEach((row, idx) => {
-      const [rep, today] = row;
-      msg += `${idx + 1}. ${rep} – ${today}\n`;
-    });
-    msg += '\nHustlers eat first. Stay in motion.';
+    let msg = 
+`✨ *KA$H $UPPLY LIVE* ✨
+
+${standings.map((row, idx) => {
+  const [rep, today] = row;
+
+  const medal = idx === 0 ? "🥇" :
+                idx === 1 ? "🥈" :
+                idx === 2 ? "🥉" :
+                "▪️";
+
+  return `${medal}  *${rep}* — ${today}`;
+}).join("\n")}
+
+———————————————
+🔥 Who's Next!? Everybody Eats! 🔥`;
 
     await sendGroupMeMessage(msg);
   } catch (err) {
