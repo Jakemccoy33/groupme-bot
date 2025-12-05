@@ -64,18 +64,33 @@ async function updateLeaderboardAndGetStandings(repName, todayReported, saleDeta
       nowIso,
     ]);
   } else {
-    const row = rows[repIndex];
+        const row = rows[repIndex];
 
     let today = parseInt(row[1] || '0', 10);
     let week = parseInt(row[2] || '0', 10);
     let month = parseInt(row[3] || '0', 10);
     let lifetime = parseInt(row[4] || '0', 10);
 
+    // LastUpdate from sheet (ISO string or blank)
+    const prevLastUpdate = row[5] || '';
+    const prevDate = prevLastUpdate ? prevLastUpdate.slice(0, 10) : null; // 'YYYY-MM-DD'
+    const currentDate = saleDetails.saleDate; // also 'YYYY-MM-DD'
+
+    // If this is a new calendar day, reset today's count
+    if (prevDate && prevDate !== currentDate) {
+      today = 0;
+    }
+
     const prevToday = today;
 
     // delta = how many NEW sales since last update
     let delta = todayReported - prevToday;
-    if (delta < 0) delta = 0; // guard against someone typing a lower number by mistake
+
+    // If delta goes negative (rep typed a smaller number) fall back to treating
+    // todayReported as fresh sales for the day.
+    if (delta < 0) {
+      delta = todayReported;
+    }
 
     today = todayReported;
     week += delta;
@@ -88,9 +103,9 @@ async function updateLeaderboardAndGetStandings(repName, todayReported, saleDeta
       week.toString(),
       month.toString(),
       lifetime.toString(),
-      nowIso,
+      nowIso, // update LastUpdate to this event
     ];
-  }
+
 
   // Sort by Today descending
   rows.sort(
