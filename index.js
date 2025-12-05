@@ -31,40 +31,59 @@ async function sendGroupMeMessage(text) {
 }
 
 // Parse messages like "🛜 +1 Jane Doe 11/25 Kinetic 1G"
+// but be forgiving about emoji, spacing, and extra words.
 function parseSalesMessage(text, senderName) {
   if (!text) return null;
 
-  // Only treat messages with the 🛜 emoji as sales
-  if (!text.includes('🛜')) {
-    return null;
-  }
-
   const trimmed = text.trim();
+
+  // Split into tokens on whitespace
   const tokens = trimmed.split(/\s+/);
+  if (tokens.length < 3) return null;
 
-  // Expect at least: emoji, +1, name..., date, provider..., speed
-  if (tokens.length < 5) return null;
+  // Find the token that contains the first integer (e.g. "+1", "1", "+3")
+  const numberRegex = /[+-]?\d+/;
+  const countIndex = tokens.findIndex((t) => numberRegex.test(t));
+  if (countIndex === -1) return null;
 
-  // Token 1 should be +1, +2, etc
-  const countMatch = tokens[1].match(/([+-]?\d+)/);
-  if (!countMatch) return null;
+  const countMatch = tokens[countIndex].match(numberRegex);
+  const todayReported = parseInt(countMatch[0], 10);
+  if (Number.isNaN(todayReported)) return null;
 
-  const todayReported = parseInt(countMatch[1], 10);
-
-  // Find install date (MM/DD)
+  // Find install date token "MM/DD"
   const dateRegex = /^\d{1,2}\/\d{1,2}$/;
   const dateIndex = tokens.findIndex((t) => dateRegex.test(t));
-  if (dateIndex === -1) return null;
+  if (dateIndex === -1 || dateIndex <= countIndex + 0) {
+    // Need a date after the count
+    return null;
+  }
+  const installDate = tokens[dateIndex];
 
-  // Speed = last token (1G, 500M, etc.)
-  const speed = tokens[tokens.length - 1];
+  // Speed = last token (1G, 2G, 500M, etc.)
+  let speed = tokens[tokens.length - 1];
 
-  // Provider = everything between date and last token
-  const providerTokens = tokens.slice(dateIndex + 1, tokens.length - 1);
-  const provider = providerTokens.join(' ') || '';
+  // If last token is something like "max" or junk, try second to last
+  if (!/^\d+([GMgm]|Mbps|mbps)?$/.test(speed)) {
+    if (tokens.length >= 2) {
+      const maybeSpeed = tokens[tokens.length - 2];
+      if (/^\d+([GMgm]|Mbps|mbps)?$/.test(maybeSpeed)) {
+        speed = maybeSpeed;
+      }
+    }
+  }
 
-  // Customer name = tokens between +1 and install date
-  const nameTokens = tokens.slice(2, dateIndex);
+  // Provider = tokens between date and speed
+  const speedIndex = tokens.lastIndexOf(speed);
+  let provider = '';
+  if (speedIndex > dateIndex + 0) {
+    const providerTokens = tokens.slice(dateIndex + 1, speedIndex);
+    provider = providerTokens.join(' ');
+  }
+
+  // Customer name = everything between count token and date token
+  const nameStart = countIndex + 1;
+  const nameEnd = dateIndex;
+  const nameTokens = tokens.slice(nameStart, nameEnd);
   const customerName = nameTokens.join(' ');
 
   // Sale date & timestamp
@@ -72,19 +91,20 @@ function parseSalesMessage(text, senderName) {
   const saleDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
   const timestamp = now.toISOString();
 
-  const repName = senderName; // GroupMe sender's display name
+  const repName = senderName;
 
   return {
     repName,
     todayReported,
     customerName,
-    installDate: tokens[dateIndex], // e.g. "11/25"
+    installDate,
     provider,
     speed,
     saleDate,
     timestamp,
   };
 }
+
 
 // Webhook endpoint for GroupMe
 app.post('/groupme/webhook', async (req, res) => {
