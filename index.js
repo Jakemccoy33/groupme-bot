@@ -1,245 +1,245 @@
-const { google } = require('googleapis');
+const express = require('express');
+const bodyParser = require('body-parser');
+const axios = require('axios');
 require('dotenv').config();
 
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
-
-// Leaderboard: A:Rep, B:Today, C:Week, D:Month, E:Lifetime, F:LastUpdate
-const LEADERBOARD_RANGE = 'Leaderboard!A:F';
-
-// Sales log: A:Timestamp, B:Rep, C:Customer, D:SaleDate, E:InstallDate, F:Provider, G:Speed, H:TodayReported
-const SALESLOG_RANGE = 'SalesLog!A:H';
-
-const auth = new google.auth.GoogleAuth({
-  keyFile: 'service-account.json',
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
-
-async function getSheetsClient() {
-  const client = await auth.getClient();
-  return google.sheets({ version: 'v4', auth: client });
-}
-
-/**
- * Main update: adjust Today/Week/Month/Lifetime for a rep, and append to SalesLog.
- */
-async function updateLeaderboardAndGetStandings(repName, todayReported, saleDetails) {
-  const sheets = await getSheetsClient();
-
-  // ---- 1) Read current leaderboard ----
-  const getRes = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: LEADERBOARD_RANGE,
-  });
-
-  let values = getRes.data.values || [];
-
-  if (values.length === 0) {
-    values = [['Rep', 'Today', 'Week', 'Month', 'Lifetime', 'LastUpdate']];
-  }
-
-  const header = values[0];
-  let rows = values.slice(1);
-
-  const nowIso = new Date().toISOString();
-  const currentDate = saleDetails.saleDate; // 'YYYY-MM-DD'
-
-  // Find rep row
-  let repIndex = rows.findIndex(
-    (r) => r[0] && r[0].toLowerCase() === repName.toLowerCase()
-  );
-
-  if (repIndex === -1) {
-    // New rep: treat todayReported as Today/Week/Month/Lifetime
-    rows.push([
-      repName,
-      todayReported.toString(),
-      todayReported.toString(),
-      todayReported.toString(),
-      todayReported.toString(),
-      nowIso,
-    ]);
-  } else {
-    const row = rows[repIndex];
-
-    let today = parseInt(row[1] || '0', 10);
-    let week = parseInt(row[2] || '0', 10);
-    let month = parseInt(row[3] || '0', 10);
-    let lifetime = parseInt(row[4] || '0', 10);
-
-    const prevLastUpdate = row[5] || '';
-    const prevDate = prevLastUpdate ? prevLastUpdate.slice(0, 10) : null; // 'YYYY-MM-DD'
-
-    // If this is a new day for this rep, reset today's baseline
-    if (prevDate && prevDate !== currentDate) {
-      today = 0;
-    }
-
-    const prevToday = today;
-
-    // delta = how many NEW sales since last update
-    let delta = todayReported - prevToday;
-
-    // If delta goes negative (rep typed a smaller number), treat todayReported as fresh sales
-    if (delta < 0) {
-      delta = todayReported;
-    }
-
-    today = todayReported;
-    week += delta;
-    month += delta;
-    lifetime += delta;
-
-    rows[repIndex] = [
-      row[0],
-      today.toString(),
-      week.toString(),
-      month.toString(),
-      lifetime.toString(),
-      nowIso,
-    ];
-  }
-
-  // Sort rows by Today desc
-  rows.sort(
-    (a, b) => parseInt(b[1] || '0', 10) - parseInt(a[1] || '0', 10)
-  );
-
-  const newValues = [header, ...rows];
-
-  // ---- 2) Write leaderboard back ----
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: LEADERBOARD_RANGE,
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: newValues,
-    },
-  });
-
-  // ---- 3) Append to SalesLog ----
-  const { customerName, installDate, provider, speed, saleDate, timestamp } =
-    saleDetails;
-
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: SALESLOG_RANGE,
-    valueInputOption: 'RAW',
-    insertDataOption: 'INSERT_ROWS',
-    requestBody: {
-      values: [
-        [
-          timestamp,
-          repName,
-          customerName,
-          saleDate,
-          installDate,
-          provider,
-          speed,
-          todayReported.toString(),
-        ],
-      ],
-    },
-  });
-
-  // Return [Rep, Today] pairs for scoreboard
-  return rows.map((r) => [r[0], r[1]]);
-}
-
-/**
- * Get per-rep totals for a given date (YYYY-MM-DD) from SalesLog (for nightly recap).
- */
-async function getDailySummary(dateIso) {
-  const sheets = await getSheetsClient();
-
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: SALESLOG_RANGE,
-  });
-
-  const values = res.data.values || [];
-  if (values.length <= 1) return { perRep: [], total: 0 };
-
-  const rows = values.slice(1); // skip header
-
-  const counts = new Map();
-  let total = 0;
-
-  for (const row of rows) {
-    const rep = row[1] || '';
-    const saleDate = row[3] || ''; // D: SaleDate
-    if (!rep || !saleDate) continue;
-
-    if (saleDate === dateIso) {
-      const current = counts.get(rep) || 0;
-      counts.set(rep, current + 1);
-      total += 1;
-    }
-  }
-
-  const perRep = Array.from(counts.entries())
-    .map(([rep, count]) => ({ rep, count }))
-    .sort((a, b) => b.count - a.count);
-
-  return { perRep, total };
-}
-
-/**
- * Reset Today for all reps; if it's Monday, also reset Week.
- */
-async function resetTodayAndMaybeWeek(currentDateIso) {
-  const sheets = await getSheetsClient();
-
-  const getRes = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: LEADERBOARD_RANGE,
-  });
-
-  let values = getRes.data.values || [];
-  if (values.length === 0) {
-    values = [['Rep', 'Today', 'Week', 'Month', 'Lifetime', 'LastUpdate']];
-  }
-
-  const header = values[0];
-  let rows = values.slice(1);
-
-  const nowIso = new Date().toISOString();
-  const isMonday = new Date(currentDateIso).getDay() === 1; // 1 = Monday
-
-  rows = rows.map((row) => {
-    const rep = row[0] || '';
-    if (!rep) return row;
-
-    let today = 0; // always reset Today
-    let week = parseInt(row[2] || '0', 10);
-    let month = parseInt(row[3] || '0', 10);
-    let lifetime = parseInt(row[4] || '0', 10);
-
-    if (isMonday) {
-      week = 0;
-    }
-
-    return [
-      rep,
-      today.toString(),
-      week.toString(),
-      month.toString(),
-      lifetime.toString(),
-      nowIso,
-    ];
-  });
-
-  const newValues = [header, ...rows];
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range: LEADERBOARD_RANGE,
-    valueInputOption: 'RAW',
-    requestBody: { values: newValues },
-  });
-}
-
-module.exports = {
+const {
   updateLeaderboardAndGetStandings,
   getDailySummary,
   resetTodayAndMaybeWeek,
-};
+} = require('./sheets');
+
+const app = express();
+app.use(bodyParser.json());
+
+const GROUPME_BOT_ID = process.env.GROUPME_BOT_ID;
+
+// Simple health check
+app.get('/', (req, res) => {
+  res.send('Node.js GroupMe bot is running!');
+});
+
+// Helper: send a message back into the GroupMe group
+async function sendGroupMeMessage(text) {
+  if (!GROUPME_BOT_ID) {
+    console.error('GROUPME_BOT_ID is not set; cannot send GroupMe message.');
+    return;
+  }
+
+  try {
+    await axios.post('https://api.groupme.com/v3/bots/post', {
+      bot_id: GROUPME_BOT_ID,
+      text,
+    });
+  } catch (err) {
+    console.error(
+      'Error sending GroupMe message:',
+      err.response?.data || err.message
+    );
+  }
+}
+
+/**
+ * Forgiving parser for sale callouts.
+ * Handles formats like:
+ *  "🛜 +1 Jane Doe 11/25 Kinetic 1G"
+ *  "📶+2 Elliott Ezell 11/25 Kinetic 2G max 1-3"
+ * Any emoji (or none), extra words after speed, etc.
+ */
+function parseSalesMessage(text, senderName) {
+  if (!text) return null;
+
+  const trimmed = text.trim();
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length < 3) return null;
+
+  // Find the token with the first integer (e.g. "+1", "1", "+3")
+  const numberRegex = /[+-]?\d+/;
+  const countIndex = tokens.findIndex((t) => numberRegex.test(t));
+  if (countIndex === -1) return null;
+
+  const countMatch = tokens[countIndex].match(numberRegex);
+  const todayReported = parseInt(countMatch[0], 10);
+  if (Number.isNaN(todayReported)) return null;
+
+  // Find install date token "MM/DD"
+  const dateRegex = /^\d{1,2}\/\d{1,2}$/;
+  const dateIndex = tokens.findIndex((t) => dateRegex.test(t));
+  if (dateIndex === -1 || dateIndex <= countIndex) {
+    // Need a date after the count
+    return null;
+  }
+  const installDate = tokens[dateIndex];
+
+  // Speed = last token that looks like "1G", "2G", "500M", etc.
+  let speed = tokens[tokens.length - 1];
+
+  const speedPattern = /^\d+([GMgm]|Mbps|mbps)?$/;
+  if (!speedPattern.test(speed) && tokens.length >= 2) {
+    const maybeSpeed = tokens[tokens.length - 2];
+    if (speedPattern.test(maybeSpeed)) {
+      speed = maybeSpeed;
+    }
+  }
+
+  const speedIndex = tokens.lastIndexOf(speed);
+
+  // Provider = tokens between date and speed
+  let provider = '';
+  if (speedIndex > dateIndex + 0) {
+    const providerTokens = tokens.slice(dateIndex + 1, speedIndex);
+    provider = providerTokens.join(' ');
+  }
+
+  // Customer name = everything between count token and date token
+  const nameStart = countIndex + 1;
+  const nameEnd = dateIndex;
+  const nameTokens = tokens.slice(nameStart, nameEnd);
+  const customerName = nameTokens.join(' ');
+
+  // Sale date & timestamp
+  const now = new Date();
+  const saleDate = now.toISOString().split('T')[0]; // YYYY-MM-DD
+  const timestamp = now.toISOString();
+
+  const repName = senderName;
+
+  return {
+    repName,
+    todayReported,
+    customerName,
+    installDate,
+    provider,
+    speed,
+    saleDate,
+    timestamp,
+  };
+}
+
+// Webhook endpoint for GroupMe
+app.post('/groupme/webhook', async (req, res) => {
+  const body = req.body;
+
+  const { text, name, sender_type } = body;
+
+  console.log('Incoming message:', { text, name, sender_type });
+
+  // Ignore messages from bots (including ourselves)
+  if (sender_type === 'bot') {
+    return res.status(200).send('Ignored bot message');
+  }
+
+  const parsed = parseSalesMessage(text, name);
+  if (!parsed) {
+    // Not a sales update, just ignore
+    return res.status(200).send('No sales data parsed');
+  }
+
+  const {
+    repName,
+    todayReported,
+    customerName,
+    installDate,
+    provider,
+    speed,
+    saleDate,
+    timestamp,
+  } = parsed;
+
+  console.log('Parsed sale:', parsed);
+
+  try {
+    const saleDetails = {
+      customerName,
+      installDate,
+      provider,
+      speed,
+      saleDate,
+      timestamp,
+    };
+
+    const standings = await updateLeaderboardAndGetStandings(
+      repName,
+      todayReported,
+      saleDetails
+    );
+
+    // Kash Supply styled scoreboard message
+    let msg =
+`✨ *Kash Supply Live Leaderboard* ✨
+
+${standings
+  .map((row, idx) => {
+    const [rep, today] = row;
+
+    const medal =
+      idx === 0 ? '🥇' :
+      idx === 1 ? '🥈' :
+      idx === 2 ? '🥉' :
+      '▪️';
+
+    return `${medal}  *${rep}* — ${today}`;
+  })
+  .join('\n')}
+
+———————————————
+🔥 Who's Next!? Everybody Eats! 🔥`;
+
+    await sendGroupMeMessage(msg);
+  } catch (err) {
+    console.error('Error updating leaderboard:', err);
+  }
+
+  return res.status(200).send('OK');
+});
+
+// Nightly cron endpoint: daily recap + reset Today (and Week on Mondays).
+// Set an external cron (e.g. cron-job.org) to hit this once per night.
+app.get('/cron/daily', async (req, res) => {
+  try {
+    const now = new Date();
+
+    // Recap yesterday
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const yIso = yesterday.toISOString().split('T')[0];
+
+    const { perRep, total } = await getDailySummary(yIso);
+
+    let msg = `📆 *Daily Recap for ${yIso}*\n\n`;
+
+    if (total === 0) {
+      msg += `No installs recorded yesterday. Unacceptable. Fix it today.`;
+    } else {
+      msg += `Total installs: ${total}\n\n`;
+
+      if (perRep.length > 0) {
+        msg += `Top Closers:\n`;
+        perRep.slice(0, 3).forEach((entry, idx) => {
+          const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : '🥉';
+          msg += `${medal} ${entry.rep} — ${entry.count}\n`;
+        });
+
+        if (perRep.length > 3) {
+          msg += `\nEveryone else: scoreboard doesn’t lie.`;
+        }
+      }
+    }
+
+    await sendGroupMeMessage(msg);
+
+    // Reset today's counters (for the new day)
+    const todayIso = now.toISOString().split('T')[0];
+    await resetTodayAndMaybeWeek(todayIso);
+
+    res.send('Daily recap sent and counters reset.');
+  } catch (err) {
+    console.error('Error in /cron/daily:', err);
+    res.status(500).send('Error running daily cron.');
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
