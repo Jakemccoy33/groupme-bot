@@ -174,6 +174,7 @@ ${standings.map((row, idx) => {
 ———————————————
 🔥 Who's Next!? Everybody Eats! 🔥`;
 
+  
     await sendGroupMeMessage(msg);
   } catch (err) {
     console.error('Error updating leaderboard:', err);
