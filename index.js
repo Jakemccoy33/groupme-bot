@@ -158,7 +158,7 @@ app.post('/groupme/webhook', async (req, res) => {
 
     // Build a simple scoreboard message
     let msg = 
-`✨ *KA$H $UPPLY LIVE* ✨
+`✨ *Kash Supply Live Leaderboard* ✨
 
 ${standings.map((row, idx) => {
   const [rep, today] = row;
@@ -174,7 +174,6 @@ ${standings.map((row, idx) => {
 ———————————————
 🔥 Who's Next!? Everybody Eats! 🔥`;
 
-  
     await sendGroupMeMessage(msg);
   } catch (err) {
     console.error('Error updating leaderboard:', err);
