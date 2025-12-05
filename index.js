@@ -3,7 +3,11 @@ const bodyParser = require('body-parser');
 const axios = require('axios');
 require('dotenv').config();
 
-const { updateLeaderboardAndGetStandings } = require('./sheets');
+const {
+  updateLeaderboardAndGetStandings,
+  getDailySummary,
+  resetTodayAndMaybeWeek,
+} = require('./sheets');
 
 const app = express();
 app.use(bodyParser.json());
@@ -17,6 +21,11 @@ app.get('/', (req, res) => {
 
 // Helper: send a message back into the GroupMe group
 async function sendGroupMeMessage(text) {
+  if (!GROUPME_BOT_ID) {
+    console.error('GROUPME_BOT_ID is not set; cannot send GroupMe message.');
+    return;
+  }
+
   try {
     await axios.post('https://api.groupme.com/v3/bots/post', {
       bot_id: GROUPME_BOT_ID,
@@ -30,18 +39,21 @@ async function sendGroupMeMessage(text) {
   }
 }
 
-// Parse messages like "🛜 +1 Jane Doe 11/25 Kinetic 1G"
-// but be forgiving about emoji, spacing, and extra words.
+/**
+ * Forgiving parser for sale callouts.
+ * Handles formats like:
+ *  "🛜 +1 Jane Doe 11/25 Kinetic 1G"
+ *  "📶+2 Elliott Ezell 11/25 Kinetic 2G max 1-3"
+ * Any emoji (or none), extra words after speed, etc.
+ */
 function parseSalesMessage(text, senderName) {
   if (!text) return null;
 
   const trimmed = text.trim();
-
-  // Split into tokens on whitespace
   const tokens = trimmed.split(/\s+/);
   if (tokens.length < 3) return null;
 
-  // Find the token that contains the first integer (e.g. "+1", "1", "+3")
+  // Find the token with the first integer (e.g. "+1", "1", "+3")
   const numberRegex = /[+-]?\d+/;
   const countIndex = tokens.findIndex((t) => numberRegex.test(t));
   if (countIndex === -1) return null;
@@ -53,27 +65,26 @@ function parseSalesMessage(text, senderName) {
   // Find install date token "MM/DD"
   const dateRegex = /^\d{1,2}\/\d{1,2}$/;
   const dateIndex = tokens.findIndex((t) => dateRegex.test(t));
-  if (dateIndex === -1 || dateIndex <= countIndex + 0) {
+  if (dateIndex === -1 || dateIndex <= countIndex) {
     // Need a date after the count
     return null;
   }
   const installDate = tokens[dateIndex];
 
-  // Speed = last token (1G, 2G, 500M, etc.)
+  // Speed = last token that looks like "1G", "2G", "500M", etc.
   let speed = tokens[tokens.length - 1];
 
-  // If last token is something like "max" or junk, try second to last
-  if (!/^\d+([GMgm]|Mbps|mbps)?$/.test(speed)) {
-    if (tokens.length >= 2) {
-      const maybeSpeed = tokens[tokens.length - 2];
-      if (/^\d+([GMgm]|Mbps|mbps)?$/.test(maybeSpeed)) {
-        speed = maybeSpeed;
-      }
+  const speedPattern = /^\d+([GMgm]|Mbps|mbps)?$/;
+  if (!speedPattern.test(speed) && tokens.length >= 2) {
+    const maybeSpeed = tokens[tokens.length - 2];
+    if (speedPattern.test(maybeSpeed)) {
+      speed = maybeSpeed;
     }
   }
 
-  // Provider = tokens between date and speed
   const speedIndex = tokens.lastIndexOf(speed);
+
+  // Provider = tokens between date and speed
   let provider = '';
   if (speedIndex > dateIndex + 0) {
     const providerTokens = tokens.slice(dateIndex + 1, speedIndex);
@@ -105,12 +116,10 @@ function parseSalesMessage(text, senderName) {
   };
 }
 
-
 // Webhook endpoint for GroupMe
 app.post('/groupme/webhook', async (req, res) => {
   const body = req.body;
 
-  // GroupMe sends a lot; we mainly care about:
   const { text, name, sender_type } = body;
 
   console.log('Incoming message:', { text, name, sender_type });
@@ -140,7 +149,6 @@ app.post('/groupme/webhook', async (req, res) => {
   console.log('Parsed sale:', parsed);
 
   try {
-    // Update Google Sheet (leaderboard + sales log) and get fresh standings
     const saleDetails = {
       customerName,
       installDate,
@@ -156,20 +164,23 @@ app.post('/groupme/webhook', async (req, res) => {
       saleDetails
     );
 
-    // Build a simple scoreboard message
-    let msg = 
+    // Kash Supply styled scoreboard message
+    let msg =
 `✨ *Kash Supply Live Leaderboard* ✨
 
-${standings.map((row, idx) => {
-  const [rep, today] = row;
+${standings
+  .map((row, idx) => {
+    const [rep, today] = row;
 
-  const medal = idx === 0 ? "🥇" :
-                idx === 1 ? "🥈" :
-                idx === 2 ? "🥉" :
-                "▪️";
+    const medal =
+      idx === 0 ? '🥇' :
+      idx === 1 ? '🥈' :
+      idx === 2 ? '🥉' :
+      '▪️';
 
-  return `${medal}  *${rep}* — ${today}`;
-}).join("\n")}
+    return `${medal}  *${rep}* — ${today}`;
+  })
+  .join('\n')}
 
 ———————————————
 🔥 Who's Next!? Everybody Eats! 🔥`;
@@ -180,6 +191,51 @@ ${standings.map((row, idx) => {
   }
 
   return res.status(200).send('OK');
+});
+
+// Nightly cron endpoint: daily recap + reset Today (and Week on Mondays).
+// Set an external cron (e.g. cron-job.org) to hit this once per night.
+app.get('/cron/daily', async (req, res) => {
+  try {
+    const now = new Date();
+
+    // Recap yesterday
+    const yesterday = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const yIso = yesterday.toISOString().split('T')[0];
+
+    const { perRep, total } = await getDailySummary(yIso);
+
+    let msg = `📆 *Daily Recap for ${yIso}*\n\n`;
+
+    if (total === 0) {
+      msg += `No installs recorded yesterday. Unacceptable. Fix it today.`;
+    } else {
+      msg += `Total installs: ${total}\n\n`;
+
+      if (perRep.length > 0) {
+        msg += `Top Closers:\n`;
+        perRep.slice(0, 3).forEach((entry, idx) => {
+          const medal = idx === 0 ? '🥇' : idx === 1 ? '🥈' : '🥉';
+          msg += `${medal} ${entry.rep} — ${entry.count}\n`;
+        });
+
+        if (perRep.length > 3) {
+          msg += `\nEveryone else: scoreboard doesn’t lie.`;
+        }
+      }
+    }
+
+    await sendGroupMeMessage(msg);
+
+    // Reset today's counters (for the new day)
+    const todayIso = now.toISOString().split('T')[0];
+    await resetTodayAndMaybeWeek(todayIso);
+
+    res.send('Daily recap sent and counters reset.');
+  } catch (err) {
+    console.error('Error in /cron/daily:', err);
+    res.status(500).send('Error running daily cron.');
+  }
 });
 
 // Start server
